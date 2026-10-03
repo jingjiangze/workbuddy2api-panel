@@ -28,12 +28,6 @@ type Config struct {
 	// 且当时只能回不可重试的 400。
 	BodyIdleTimeoutSeconds int `json:"body_idle_timeout_seconds"`
 
-	// BodyIdleTimeoutSeconds 读请求体的「无进展」上限：连续 N 秒收不到任何字节才放弃，
-	// 只要还在持续收字节就不断（按进度续期）。<=0 回落默认 90。取代原先
-	// http.Server.ReadTimeout 的整包 60s 计时——慢速链路上传大上下文时，整包计时会把
-	// 「还在动但没传完」误判成失败，且当时回的是不可重试的 400。
-	BodyIdleTimeoutSeconds int `json:"body_idle_timeout_seconds"`
-
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
