@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -39,6 +38,10 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// BodyIdleTimeout 读请求体的「无进展」上限：连续无字节即掐，有进展就续期。
+	// <=0 时 NewHandler 回落 90s（与 config.body_idle_timeout_seconds 同缺省）。
+	BodyIdleTimeout time.Duration
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -127,6 +130,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	if cfg.BodyIdleTimeout <= 0 {
+		cfg.BodyIdleTimeout = 90 * time.Second
 	}
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
@@ -507,8 +513,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
 	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
 	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	body, err := readBodyIdle(w, r, h.cfg.BodyIdleTimeout)
 	if err != nil {
+		var te interface{ Timeout() bool }
+		if errors.As(err, &te) && te.Timeout() {
+			// 读空闲超时：请求尚未进上游、账号未被计入任何统计，客户端重试必然安全。
+			// 回 408（而非 400）才在 OpenAI 兼容客户端的重试白名单里，能自动消化网络抖动。
+			writeOpenAIError(w, http.StatusRequestTimeout, "request_timeout",
+				"read body: no data within idle window")
+			return
+		}
+		// 其余读错误（客户端断流/截断）仍按 400：不把半截 JSON 喂上游 unmarshal
+		// 报 unexpected EOF 冤枉罚号（#41 语义保留）。
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}

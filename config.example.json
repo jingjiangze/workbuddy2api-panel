@@ -1,5 +1,6 @@
 {
   "listen": ":7863",
+  "body_idle_timeout_seconds": 90,
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",

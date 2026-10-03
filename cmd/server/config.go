@@ -22,6 +22,18 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
+	// BodyIdleTimeoutSeconds 读请求体的「无进展」上限：连续 N 秒收不到任何字节才放弃，
+	// 只要还在持续收字节就一直续期。<=0 回落默认 90。取代原 http.Server.ReadTimeout
+	// 的整包计时——慢速链路上传大上下文时，「还在动但没传完」会被整包超时误杀，
+	// 且当时只能回不可重试的 400。
+	BodyIdleTimeoutSeconds int `json:"body_idle_timeout_seconds"`
+
+	// BodyIdleTimeoutSeconds 读请求体的「无进展」上限：连续 N 秒收不到任何字节才放弃，
+	// 只要还在持续收字节就不断（按进度续期）。<=0 回落默认 90。取代原先
+	// http.Server.ReadTimeout 的整包 60s 计时——慢速链路上传大上下文时，整包计时会把
+	// 「还在动但没传完」误判成失败，且当时回的是不可重试的 400。
+	BodyIdleTimeoutSeconds int `json:"body_idle_timeout_seconds"`
+
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
@@ -518,6 +530,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	if c.BodyIdleTimeoutSeconds <= 0 {
+		c.BodyIdleTimeoutSeconds = 90
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.11-panel"
+const appVersion = "1.11.11-fix1-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -303,6 +303,8 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		// 读请求体的空闲上限（按进度续期）：cfg 已 normalize，缺省 90s。
+		BodyIdleTimeout: time.Duration(cfg.BodyIdleTimeoutSeconds) * time.Second,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 	})
@@ -324,10 +326,11 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
-		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 请求体已无网关侧上限（max_body_mb 移除），60s 按常规带宽的数十 MB
-		// 上传余量取值；超大 body 慢速上传若超时，由客户端重试。
-		ReadTimeout: 60 * time.Second,
+		// ReadTimeout 整包计时降级为纯兜底：原先的 60s 会把「慢但持续有进展」的
+		// 大上下文上传误判成超时，且读超时发生在 handler 之外、只能回不可重试的
+		// 400（与注释里「由客户端重试」的意图自相矛盾）。真正的判据改到
+		// chatCompletions 侧按进度续期的 BodyIdleTimeout，超时回 408 可重试。
+		ReadTimeout: 15 * time.Minute,
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
