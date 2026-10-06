@@ -548,11 +548,14 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 语义零风险。作用有二——① 设完头立刻 priming，客户端不必等上游首帧就能确认
 	// 连接活着；② 上游长时间静默（首帧前或中途卡顿）时持续有字节可收，
 	// 不再被 ai-sdk 一类客户端判成死连接而 ECONNRESET。
-	pingStop := make(chan struct{})
-	defer close(pingStop)
+	//
+	// 心跳 goroutine 必须在本函数返回前**停并_join_**：Go 规定 handler 返回后
+	// ResponseWriter 不得再被使用，只 close(stop) 不等待会让最后一拍写到已回收的 w 上。
 	if o.pingInterval > 0 {
-		_ = writeOut(": wb2api\n\n")
+		stop := make(chan struct{})
+		finished := make(chan struct{})
 		go func() {
+			defer close(finished)
 			tk := time.NewTicker(o.pingInterval)
 			defer tk.Stop()
 			for {
@@ -561,11 +564,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 					if err := writeOut(": ping\n\n"); err != nil {
 						return
 					}
-				case <-pingStop:
+				case <-stop:
 					return
 				}
 			}
 		}()
+		defer func() { close(stop); <-finished }()
+		_ = writeOut(": wb2api\n\n")
 	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
