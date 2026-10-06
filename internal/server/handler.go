@@ -74,6 +74,10 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// StreamPing 流式响应 SSE 注释帧心跳间隔（server.stream_ping，缺省 15s；
+	// 0 = 关闭）。上游首帧前的静默期靠它让客户端确认连接活着。
+	StreamPing time.Duration
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -118,6 +122,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// oversize 上下文超限 fail-fast 状态机（oversize.go）：某模型已被上游拒过某个
+	// body 规模 → TTL 内同规模及以上的请求就地拒绝，不再花 7s 真打上游。
+	// 进程内状态、重启清零。
+	oversize oversizeGate
 }
 
 // NewHandler 构建 handler。
@@ -540,6 +548,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 上下文超限 fail-fast：同模型已有「这个 body 规模被上游拒过」的证据 → 就地拒绝，
+	// 不再花中位 7s 真打上游，也不再给流式客户端留「只有响应头、零字节」的静默窗口
+	// （那个窗口会被 ai-sdk 判成 ECONNRESET 并放大成重试风暴）。见 oversize.go。
+	if limit, hit := h.oversize.blocked(bareModel, len(body)); hit {
+		h.rejectOversize(w, st, bareModel, len(body), limit)
+		return
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
@@ -883,6 +899,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
+				// 喂学习式闸门：这次真实拒绝 = 「该模型下 len(body) 规模必失败」的证据。
+				h.oversize.note(bareModel, len(body), promptTooLongLimit(string(respBody)))
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -954,7 +972,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			var errFrame string
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
+				upstream.WithStreamPing(h.cfg.StreamPing))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
