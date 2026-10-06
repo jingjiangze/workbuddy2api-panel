@@ -549,11 +549,14 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 连接活着；② 上游长时间静默（首帧前或中途卡顿）时持续有字节可收，
 	// 不再被 ai-sdk 一类客户端判成死连接而 ECONNRESET。
 	//
-	// 心跳 goroutine 必须在本函数返回前**停并_join_**：Go 规定 handler 返回后
-	// ResponseWriter 不得再被使用，只 close(stop) 不等待会让最后一拍写到已回收的 w 上。
+	// 生命周期两条硬约束：① 心跳 goroutine 必须 join 回本 goroutine 之后函数才能返回
+	// （Go 规定 handler 返回后 ResponseWriter 不得再用，只 close 不等待会让最后一拍
+	// 写到已回收的 w 上）；② 尾帧 [DONE] 之前先停，避免在 [DONE] 后面补注释帧。
+	stopPing, waitPing := func() {}, func() {}
 	if o.pingInterval > 0 {
 		stop := make(chan struct{})
 		finished := make(chan struct{})
+		var stopOnce sync.Once
 		go func() {
 			defer close(finished)
 			tk := time.NewTicker(o.pingInterval)
@@ -569,7 +572,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				}
 			}
 		}()
-		defer func() { close(stop); <-finished }()
+		stopPing = func() { stopOnce.Do(func() { close(stop) }) }
+		waitPing = func() { <-finished }
+		defer func() { stopPing(); waitPing() }() // 兜底：轮转中途 return 也要 join
 		_ = writeOut(": wb2api\n\n")
 	}
 
