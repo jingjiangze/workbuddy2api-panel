@@ -1081,6 +1081,8 @@ function startAddLogin() {
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
 async function pollLogin() {
   if (!loginState) return;
+  // 去别的标签页扫码时本页通常不可见：跳过这一拍，回到页面时 visibilitychange 会立刻补一次。
+  if (document.hidden === true) return;
   try {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
     if (r.done) {
@@ -1144,21 +1146,42 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+// 页面不可见就一个请求都不发；可见才按表打。间隔从 5s 放宽到 15s：面板稳态每 tick
+// 只打 /panel/api/overview，而这一跳在远端部署下要跨太平洋（实测单请求 0.5–2s），
+// 5s 的节奏等于把链路一直占在没人看的数据上。
+const REFRESH_MS = 15000;
+function pageHidden() { return document.hidden === true; }
 function refreshVisible() {
+  if (pageHidden()) return;
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
 }
-function start() {
-  loadOverview(true);
-  if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
-  checkAuthGate();
+function startAutoRefresh() {
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+  if (pageHidden()) return;
+  refTimer = setInterval(refreshVisible, REFRESH_MS);
+}
+async function start() {
+  await loadOverview(true);
+  startAutoRefresh();
+  await checkAuthGate();
 }
 async function checkAuthGate() {
+  // 首屏的 loadOverview 已经担了鉴权（api() 见 401 自己弹密钥框）：
+  // 只有它没拿到数据时才补一次，不再无条件多打一次 overview 往返。
+  if (overviewData) return;
   try { await api('overview'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
 }
+document.addEventListener('visibilitychange', () => {
+  if (pageHidden()) {
+    if (refTimer) { clearInterval(refTimer); refTimer = null; }
+    return;
+  }
+  refreshVisible();
+  startAutoRefresh();
+});
 start();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
@@ -1684,6 +1707,8 @@ function groupsFromQueue(items) {
 function startQueuePolling() {
   if (queueTimer) clearInterval(queueTimer);
   queueTimer = setInterval(async () => {
+    // 队列执行中切走页面：这一拍不发请求；终态渲染留到回到前台的下一拍（表不停）。
+    if (document.hidden === true) return;
     let q;
     try { q = await api('tasks/queue'); } catch (e) { return; }
     if (!q.started) return;
