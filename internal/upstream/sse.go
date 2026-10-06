@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -482,6 +483,12 @@ type StreamOption func(*streamOptions)
 
 type streamOptions struct {
 	onErrorFrame func(payload string)
+	// pingInterval >0 时：设完响应头立刻 flush 一帧 SSE 注释，并按该间隔补发注释帧。
+	// 上游"想很久"（大上下文首字节实测 5.5–8.1s）期间客户端一个字节都收不到，
+	// ai-sdk 这类客户端会当成连接死了 → ECONNRESET + retryable → 重试风暴。
+	// 默认 0=关闭：只有 chat 透传路径由 handler 显式打开（见 WithStreamPing），
+	// 直接调 StreamHint 的既有测试的字节序列因此零扰动。
+	pingInterval time.Duration
 }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
@@ -490,6 +497,18 @@ type streamOptions struct {
 // 第一帧之前就把账号记成功，限流号被当成健康号；有观察者后可在流尾按帧分类处置。
 func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
+}
+
+// DefaultStreamPingInterval chat 透传流默认心跳间隔（handler 侧可配）。
+const DefaultStreamPingInterval = 15 * time.Second
+
+// WithStreamPing 打开 SSE 注释帧心跳：d>0 生效，d<=0 关闭。
+func WithStreamPing(d time.Duration) StreamOption {
+	return func(o *streamOptions) {
+		if d > 0 {
+			o.pingInterval = d
+		}
+	}
 }
 
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
@@ -511,6 +530,44 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// writeOut 串行化对 w 的一切写出（数据帧 + 心跳注释帧共用一把锁）。
+	var wrMu sync.Mutex
+	writeOut := func(s string) error {
+		wrMu.Lock()
+		defer wrMu.Unlock()
+		if _, err := io.WriteString(w, s); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+
+	// SSE 注释帧心跳（": xxx\n\n"）：所有 OpenAI 兼容客户端都按行忽略非 data: 帧，
+	// 语义零风险。作用有二——① 设完头立刻 priming，客户端不必等上游首帧就能确认
+	// 连接活着；② 上游长时间静默（首帧前或中途卡顿）时持续有字节可收，
+	// 不再被 ai-sdk 一类客户端判成死连接而 ECONNRESET。
+	pingStop := make(chan struct{})
+	defer close(pingStop)
+	if o.pingInterval > 0 {
+		_ = writeOut(": wb2api\n\n")
+		go func() {
+			tk := time.NewTicker(o.pingInterval)
+			defer tk.Stop()
+			for {
+				select {
+				case <-tk.C:
+					if err := writeOut(": ping\n\n"); err != nil {
+						return
+					}
+				case <-pingStop:
+					return
+				}
+			}
+		}()
+	}
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
@@ -529,13 +586,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if hint := frameGatewayHint(hintFn, payload); hint != "" {
 			payload = attachHintToErrorFrame(payload, hint)
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writeOut("data: " + payload + "\n\n")
 	}
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
@@ -576,11 +627,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			valid = 1
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+		if werr := writeOut("data: " + payload + "\n\n"); werr != nil {
 			return 0, werr
-		}
-		if fl != nil {
-			fl.Flush()
 		}
 		return valid, nil
 	}
@@ -604,11 +652,8 @@ readLoop:
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			if werr := writeOut(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -627,11 +672,8 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := writeOut("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if fl != nil {
-		fl.Flush()
 	}
 	if validFrames == 0 {
 		return errEmptyStream
