@@ -548,11 +548,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
-	// 上下文超限 fail-fast：同模型已有「这个 body 规模被上游拒过」的证据 → 就地拒绝，
-	// 不再花中位 7s 真打上游，也不再给流式客户端留「只有响应头、零字节」的静默窗口
-	// （那个窗口会被 ai-sdk 判成 ECONNRESET 并放大成重试风暴）。见 oversize.go。
-	if limit, hit := h.oversize.blocked(bareModel, len(body)); hit {
-		h.rejectOversize(w, st, bareModel, len(body), limit)
+	// 上下文超限 fail-fast：同模型已有「这个规模的 body 被上游判超限」的证据，且按
+	// 该证据的 token 密度估算仍然超顶 → 就地拒绝，不再花中位 7s 真打上游（oversize.go）。
+	if est, limit, hit := h.oversize.blocked(bareModel, len(body)); hit {
+		h.rejectOversize(w, st, bareModel, est, limit)
 		return
 	}
 
@@ -899,8 +898,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				// 喂学习式闸门：这次真实拒绝 = 「该模型下 len(body) 规模必失败」的证据。
-				h.oversize.note(bareModel, len(body), promptTooLongLimit(string(respBody)))
+				// 喂学习式闸门：原文里的 (实际 token, 上限) + 我们的 body 字节数 = 一条证据。
+				if usedTok, lim, ok := parsePromptTooLong(string(respBody)); ok {
+					h.oversize.note(bareModel, len(body), usedTok, lim)
+				}
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
