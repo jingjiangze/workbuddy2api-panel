@@ -51,6 +51,10 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// StreamPing 流式响应心跳间隔（如 "15s"）：上游首帧前与静默期按此间隔补发
+		// SSE 注释帧（": ping"），消除"200 已开流但客户端零字节"的窗口。
+		// 缺省 "15s"；"0" = 关闭。改动需重启进程。
+		StreamPing string `json:"stream_ping"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -228,6 +232,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ServerStreamPingDur 解析后的流式心跳间隔；0 = 关闭。
+	ServerStreamPingDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -241,6 +247,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.StreamPing = "15s"
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -472,6 +479,16 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 流式心跳间隔：空值回落默认 15s；"0" 合法（关闭）；负值 fail fast。
+	if c.Server.StreamPing == "" {
+		c.Server.StreamPing = "15s"
+	}
+	if c.ServerStreamPingDur, err = time.ParseDuration(c.Server.StreamPing); err != nil {
+		return fmt.Errorf("server.stream_ping: %w", err)
+	}
+	if c.ServerStreamPingDur < 0 {
+		return fmt.Errorf("server.stream_ping: 负时长 %q 无意义", c.Server.StreamPing)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
